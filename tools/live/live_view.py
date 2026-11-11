@@ -22,20 +22,26 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))          # tools/live -> repository root
+# Every writable artefact (dumps, logs, pid files) lives under ONE base directory.
+# Override with --base-dir or FARGO_LIVE_DIR; nothing outside it is assumed to exist.
+BASE = os.environ.get("FARGO_LIVE_DIR") or os.path.join(os.path.expanduser("~"), "fargo-live")
 CONTROL_ADDR = ("127.0.0.1", 9100)
 PORT = 8088
 SIM_PID = None
 MAX_ORBITS = 60.0
-WEB_DIR = "/home/nick/fargo-bench/web"
-CTRL_LOG = "/home/nick/fargo-bench/live-controls.log"
-BIN = None
+WEB_DIR = os.path.join(HERE, "web", "dist")            # built by tools/live/build_web.sh
+CTRL_LOG = None                                        # resolved to <BASE>/live-controls.log
+SIM_LOG = None                                         # resolved to <BASE>/live-sim.log
+BIN = None                                             # resolved to <REPO>/fargo3d
 PAR = None
 WORKDIR = None
 _popen = None
 DUMPDIR = None
-NINTERM = 10
-DT = 0.314159265359
-OMEGA = 1.0005
+NINTERM = None                                         # taken from the .par unless overridden
+DT = None                                              # taken from the .par unless overridden
+OMEGA = None                                           # taken from the .par unless overridden
 MIME = {".html": "text/html; charset=utf-8", ".js": "text/javascript",
         ".css": "text/css", ".svg": "image/svg+xml", ".png": "image/png",
         ".ico": "image/x-icon", ".json": "application/json", ".map": "application/json"}
@@ -46,7 +52,18 @@ META = {"sim_stopped": False, "buffer_full": False, "error": None,
         "connected": False, "received": 0, "rate": 0.0, "recomputing": False}
 
 
+def resolve_paths():
+    """Fill in every path derived from BASE. Called once, after the arguments are parsed."""
+    global CTRL_LOG, SIM_LOG, BIN
+    CTRL_LOG = os.path.join(BASE, "live-controls.log")
+    SIM_LOG = os.path.join(BASE, "live-sim.log")
+    if BIN is None:
+        BIN = os.path.join(REPO, "fargo3d")
+
+
 def log_control(what):
+    if not CTRL_LOG:
+        return
     try:
         with open(CTRL_LOG, "a") as f:
             f.write("%s bridge pid=%s action=%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), SIM_PID, what))
@@ -132,7 +149,7 @@ def launch(extra=None):
     env = dict(os.environ)
     env["FARGO_CONTROL_PORT"] = str(CONTROL_ADDR[1])
     args = [BIN] + (extra or []) + [PAR]
-    log = open("/home/nick/fargo-bench/live-sim.log", "ab")
+    log = open(SIM_LOG, "ab")
     _popen = subprocess.Popen(args, cwd=WORKDIR or os.path.dirname(PAR) or None,
                               stdout=log, stderr=log, stdin=subprocess.DEVNULL, env=env,
                               start_new_session=True)
@@ -152,6 +169,11 @@ def kill_sim(pid):
 
 def dump_index_for_orbit(orbit):
     """Restart index = output index. One output every NINTERM coarse steps, each DT long."""
+    if NINTERM is None or DT is None or OMEGA is None:
+        raise RuntimeError("seek needs Ninterm, DT and OmegaFrame: pass --par, or "
+                           "--ninterm / --dt / --omega explicitly")
+    if not DUMPDIR:
+        raise RuntimeError("seek needs --dumpdir pointing at the simulation's OutputDir")
     per_output = NINTERM * DT * OMEGA / (2 * 3.141592653589793)
     if per_output <= 0:
         return 0
@@ -185,8 +207,7 @@ def do_seek(orbit):
     SIM_PID = newpid
     time.sleep(1.5)
     if _popen is not None and _popen.poll() is not None:
-        raise RuntimeError("relaunch exited rc=%s - see /home/nick/fargo-bench/live-sim.log"
-                           % _popen.returncode)
+        raise RuntimeError("relaunch exited rc=%s - see %s" % (_popen.returncode, SIM_LOG))
     log_control("seek orbit=%.3f dump=%d pid=%d" % (orbit, idx, newpid))
     return idx, newpid
 
@@ -323,24 +344,131 @@ class Handler(BaseHTTPRequestHandler):
                        "application/json")
 
 
+OPTIONS = {
+    "--base-dir": str, "--web-dir": str, "--bin": str, "--par": str,
+    "--workdir": str, "--dumpdir": str, "--pid": int, "--port": int,
+    "--control-host": str, "--control-port": int, "--max-orbits": float,
+    "--ninterm": int, "--dt": float, "--omega": float,
+}
+
+USAGE = """usage: live_view.py [options]
+
+Consumes v1 frames from the in-process emitter (src/control.c) and serves them to a browser.
+Paths default to the repository this script lives in, so a fresh clone needs no editing.
+
+  --base-dir DIR        writable working directory for logs, pid files and dumps
+                        (default $FARGO_LIVE_DIR, else ~/fargo-live)
+  --web-dir DIR         directory served as the UI (default tools/live/web/dist)
+  --bin PATH            simulation binary (default <repo>/fargo3d)
+  --par PATH            .par of the running simulation; Ninterm, DT and OmegaFrame are
+                        read from it for the seek maths
+  --workdir DIR         working directory for a relaunch; must be the repository root
+  --dumpdir DIR         the simulation's OutputDir, needed for seek
+  --pid PID             pid of the running simulation, for stop/run and seek
+  --port PORT           HTTP port (default 8088)
+  --control-host HOST   emitter host (default 127.0.0.1)
+  --control-port PORT   emitter port (default 9100)
+  --max-orbits X        stop the simulation when the buffer reaches X orbits
+  --ninterm N           override Ninterm read from the .par
+  --dt X                override DT read from the .par
+  --omega X             override OmegaFrame read from the .par
+"""
+
+
+def die(msg):
+    sys.stderr.write("live_view: %s\nsee --help\n" % msg)
+    raise SystemExit(2)
+
+
+def parse_args(argv):
+    """Strict: an unrecognised option is an error, never silently ignored."""
+    vals = {}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            sys.stdout.write(USAGE)
+            raise SystemExit(0)
+        if not a.startswith("--"):
+            die("unexpected argument %r" % a)
+        key, eq, inline = a.partition("=")
+        if key not in OPTIONS:
+            die("unknown option %s" % key)
+        if eq:
+            raw = inline
+            i += 1
+        else:
+            if i + 1 >= len(argv):
+                die("%s needs a value" % key)
+            raw = argv[i + 1]
+            i += 2
+        if OPTIONS[key] is str:
+            vals[key] = raw
+        else:
+            try:
+                vals[key] = OPTIONS[key](raw)
+            except ValueError:
+                die("%s expects %s, got %r" % (key, OPTIONS[key].__name__, raw))
+    return vals
+
+
+def read_par_values(path, names):
+    """FARGO3D .par lines read 'Key   value   # comment'. Return the values asked for."""
+    out = {}
+    try:
+        with open(path, "r", errors="replace") as fh:
+            for line in fh:
+                s = line.split("#", 1)[0].strip()
+                if not s:
+                    continue
+                parts = s.split()
+                if len(parts) >= 2 and parts[0] in names:
+                    out[parts[0]] = parts[1]
+    except OSError as e:
+        die("cannot read %s: %s" % (path, e))
+    return out
+
+
 def main():
-    global CONTROL_ADDR, PORT, SIM_PID, MAX_ORBITS, BIN, PAR, DUMPDIR, NINTERM, DT, WORKDIR
-    a = sys.argv[1:]
-    for i, x in enumerate(a):
-        if x == "--control-host": CONTROL_ADDR = (a[i + 1], CONTROL_ADDR[1])
-        if x == "--control-port": CONTROL_ADDR = (CONTROL_ADDR[0], int(a[i + 1]))
-        if x == "--port":         PORT = int(a[i + 1])
-        if x == "--pid":          SIM_PID = int(a[i + 1])
-        if x == "--max-orbits":   MAX_ORBITS = float(a[i + 1])
-        if x == "--bin":          globals()["BIN"] = a[i + 1]
-        if x == "--par":          globals()["PAR"] = a[i + 1]
-        if x == "--dumpdir":      globals()["DUMPDIR"] = a[i + 1]
-        if x == "--ninterm":      globals()["NINTERM"] = int(a[i + 1])
-        if x == "--dt":           globals()["DT"] = float(a[i + 1])
-        if x == "--workdir":      globals()["WORKDIR"] = a[i + 1]
+    global CONTROL_ADDR, PORT, SIM_PID, MAX_ORBITS, BIN, PAR, DUMPDIR, WORKDIR
+    global BASE, WEB_DIR, NINTERM, DT, OMEGA
+    v = parse_args(sys.argv[1:])
+
+    if "--base-dir" in v:    BASE = os.path.abspath(v["--base-dir"])
+    if "--web-dir" in v:     WEB_DIR = os.path.abspath(v["--web-dir"])
+    if "--bin" in v:         BIN = os.path.abspath(v["--bin"])
+    if "--par" in v:         PAR = os.path.abspath(v["--par"])
+    if "--workdir" in v:     WORKDIR = os.path.abspath(v["--workdir"])
+    if "--dumpdir" in v:     DUMPDIR = os.path.abspath(v["--dumpdir"])
+    if "--pid" in v:         SIM_PID = v["--pid"]
+    if "--port" in v:        PORT = v["--port"]
+    if "--max-orbits" in v:  MAX_ORBITS = v["--max-orbits"]
+    if "--control-host" in v: CONTROL_ADDR = (v["--control-host"], CONTROL_ADDR[1])
+    if "--control-port" in v: CONTROL_ADDR = (CONTROL_ADDR[0], v["--control-port"])
+    if "--ninterm" in v:     NINTERM = v["--ninterm"]
+    if "--dt" in v:          DT = v["--dt"]
+    if "--omega" in v:       OMEGA = v["--omega"]
+
+    os.makedirs(BASE, exist_ok=True)
+    resolve_paths()
+
+    if PAR and os.path.isfile(PAR):
+        pv = read_par_values(PAR, {"Ninterm", "DT", "OmegaFrame"})
+        if NINTERM is None and "Ninterm" in pv:   NINTERM = int(float(pv["Ninterm"]))
+        if DT is None and "DT" in pv:             DT = float(pv["DT"])
+        if OMEGA is None and "OmegaFrame" in pv:  OMEGA = float(pv["OmegaFrame"])
+
+    if not os.path.isdir(WEB_DIR):
+        sys.stderr.write("live_view: warning: no UI bundle at %s - run tools/live/build_web.sh\n"
+                         % WEB_DIR)
+    if not os.path.isfile(BIN):
+        sys.stderr.write("live_view: warning: no simulation binary at %s (needed only for seek)\n"
+                         % BIN)
+
     threading.Thread(target=reader, daemon=True).start()
     print("relay: frames from %s:%d -> http 0.0.0.0:%d  pid %s  max %.1f orbits"
           % (CONTROL_ADDR[0], CONTROL_ADDR[1], PORT, SIM_PID, MAX_ORBITS), flush=True)
+    print("relay: base %s  web %s  par %s" % (BASE, WEB_DIR, PAR), flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

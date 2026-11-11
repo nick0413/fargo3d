@@ -17,3 +17,7 @@ std/.lastflags.old
 *.bak
 *tests.log
 mp.pro
+# live viewer: dependencies and the built bundle are generated, never committed
+node_modules/
+tools/live/web/dist/
+*.mp4
