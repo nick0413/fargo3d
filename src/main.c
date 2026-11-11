@@ -7,6 +7,13 @@ functions, then the main loop.
 */
 #include "fargo3d.h"
 
+void ControlInit(void);
+void ControlTick(real dtemp, real DTv);
+void ControlCoarseDone(void);
+void AccretionInit(void);
+void AccretionStep(real dt);
+void AccretionCoarse(void);
+
 int   begin_i = 0, NbRestart = 0;
 int   InnerOutputCounter=0, StillWriteOneOutput;
 real dt;
@@ -321,6 +328,9 @@ if (*SPACING=='N'){
   masterprint ("Standard version with no ghost zones in X\n");
 #endif
   
+  ControlInit();
+  AccretionInit();
+
   for (i = begin_i; i<=NTOT; i++) { // MAIN LOOP
     if (NINTERM * (TimeStep = (i / NINTERM)) == i) {
 
@@ -443,12 +453,18 @@ if (*SPACING=='N'){
 	fflush(stdout);
 #endif
       }
+      AccretionStep(dt);
+
+      ControlTick(dtemp, DT);
+
       FullArrayComms = 0;
       ContourComms = 0;
     }
     
     if(CPU_Master) printf("%s", "\n");
     
+    ControlCoarseDone();
+
     MULTIFLUID(MonitorGlobal (MONITOR2D      |	\
 			      MONITORY       |	\
 			      MONITORY_RAW   |	\
@@ -458,6 +474,7 @@ if (*SPACING=='N'){
 
     if (ThereArePlanets) {
       WritePlanetSystemFile(TimeStep, YES);
+      AccretionCoarse();   /* sink applied once per coarse step, before the orbit advance */
       SolveOrbits (Sys);
     }
   }

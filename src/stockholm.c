@@ -5,6 +5,8 @@
 
 //<INCLUDES>
 #include "fargo3d.h"
+
+extern real DampingMass;   /* defined in accretion.c (CPU-only object) */
 //<\INCLUDES>
 
 void StockholmBoundary_cpu(real dt) {
@@ -163,7 +165,15 @@ void StockholmBoundary_cpu(real dt) {
 	tau = ds*sqrt(ymed(j)*ymed(j)*ymed(j)/G/MSTAR);
 	if(ramp>0.0) {
 	  taud = tau/ramp;
-	  rho[l] = (rho[l]*taud+rho0[l2D]*dt)/(dt+taud);
+	  {
+	    real rho_old = rho[l];
+	    rho[l] = (rho[l]*taud+rho0[l2D]*dt)/(dt+taud);
+#ifndef __GPU
+	    /* mass the relaxation moves. Only in the CPU variant: the .cu translation has no
+	       host volume arrays, and stockholmboundary=g is not enabled in this build. */
+	    DampingMass += (rho[l]-rho_old)*Vol(i,j,k);
+#endif
+	  }
 #ifdef X
 	  vx0_target = vx0[l2D];
 	  radius = ymed(j);

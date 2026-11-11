@@ -306,7 +306,7 @@ EXENAME  = ../fargo3d  #Name and location of the executable file
 VPATH=${SETUPSDIR}/${SETUP}:${STDDIR}:${SCRIPTSDIR}:${SRCDIR}
 
 #---------------#Sequential and parallel objects----------------------
-MAINOBJ  = LowTasks.o psys.o main.o param.o var.o usage.o   	    \
+MAINOBJ  = LowTasks.o psys.o main.o param.o var.o usage.o control.o accretion.o   	    \
 	   split.o comm.o CompPresIso.o CompPresPoly.o         	    \
 	   boundary.o checknans.o 				    \
 	   vanleer_x_a.o vanleer_x_b.o 				    \

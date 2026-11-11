@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FARGO3D — live disk</title>
+<style>
+  :root { --bg:#0b0e13; --fg:#c8d3e0; --dim:#6b7a8f; --accent:#5ad1c8; --warn:#e0a458; --buf:#3ddc84; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { padding:10px 16px; border-bottom:1px solid #1b232e; display:flex; gap:16px;
+           align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:14px; margin:0; font-weight:600; letter-spacing:.06em; color:var(--accent); }
+  .hud span { color:var(--dim); }
+  .hud b { color:var(--fg); font-weight:600; }
+  main { display:flex; gap:16px; padding:16px; align-items:flex-start; flex-wrap:wrap; }
+  #disk { display:block; width:760px; height:760px; background:#05070a; border:1px solid #1b232e; }
+  #time { display:block; width:760px; height:64px; background:#05070a; border:1px solid #1b232e; cursor:pointer; }
+  aside { min-width:330px; flex:1; }
+  #cbar { display:block; width:760px; height:34px; }
+  #prof { display:block; width:100%; height:190px; background:#05070a; border:1px solid #1b232e; }
+  .row { display:flex; gap:8px; align-items:center; margin:10px 0; flex-wrap:wrap; }
+  button { background:#16202b; color:var(--fg); border:1px solid #26333f; padding:6px 11px;
+           border-radius:3px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  select { background:#16202b; color:var(--fg); border:1px solid #26333f;
+           padding:5px 8px; border-radius:3px; font:inherit; }
+  label { color:var(--dim); }
+  table { border-collapse:collapse; width:100%; }
+  td { padding:2px 0; }
+  td:first-child { color:var(--dim); width:46%; }
+  .note { color:var(--dim); border-left:2px solid var(--warn); padding-left:10px; margin-top:12px; }
+  .note b { color:var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>FARGO3D — LIVE DISK</h1>
+  <div class="hud"><span>t</span> <b id="t">—</b></div>
+  <div class="hud"><span>orbit</span> <b id="orbit">—</b></div>
+  <div class="hud"><span>frame</span> <b id="fid">—</b></div>
+  <div class="hud"><span>theta</span> <b id="theta">—</b></div>
+  <div class="hud"><span>buffered</span> <b id="buf">—</b></div>
+  <div class="hud"><span>sim</span> <b id="simstate">—</b></div>
+</header>
+
+<main>
+  <div>
+    <canvas id="disk" width="760" height="760"></canvas>
+    <canvas id="cbar" width="760" height="34"></canvas>
+    <canvas id="time" width="760" height="64"></canvas>
+  </div>
+  <aside>
+    <canvas id="prof" width="460" height="190"></canvas>
+    <div class="row">
+      <button id="bLive">live</button>
+      <button id="bRev">rev</button>
+      <button id="bPlay">play</button>
+      <button id="bFwd">fwd</button>
+      <select id="speed">
+        <option value="1">1 fps</option>
+        <option value="2">2 fps</option>
+        <option value="3" selected>3 fps</option>
+        <option value="5">5 fps</option>
+        <option value="10">10 fps</option>
+        <option value="20">20 fps</option>
+        <option value="60">60 fps</option>
+      </select>
+    </div>
+    <div class="row">
+      <select id="cscale">
+        <option value="log" selected>colour: log</option>
+        <option value="linear">colour: linear</option>
+      </select>
+      <select id="mode">
+        <option value="rot" selected>frame: rotating</option>
+        <option value="inertial">frame: inertial</option>
+      </select>
+      <label><input type="checkbox" id="arrows"> flow v&minus;&lang;v&rang;</label>
+      <button id="bSim">sim stop</button>
+    </div>
+    <table>
+      <tr><td>producer</td><td id="prod">—</td></tr>
+      <tr><td>frames in buffer</td><td id="count">—</td></tr>
+      <tr><td>buffer window</td><td id="win">—</td></tr>
+      <tr><td>buffer max</td><td id="bmax">—</td></tr>
+      <tr><td>payload</td><td id="nf">—</td></tr>
+      <tr><td>grid</td><td id="grid">—</td></tr>
+    </table>
+    <div class="note">
+      <b>Raw frames.</b> The picture changes only when a new frame is drawn — there is no
+      interpolation. Playback advances one stored frame at the selected target fps. The green band
+      on the timeline is the history held in RAM. When buffered history reaches the max, the
+      bridge stops the simulation for real and the whole recording stays scrubbable.
+    </div>
+  </aside>
+</main>
+
+<script>
+const disk = document.getElementById('disk'), dctx = disk.getContext('2d');
+const tl = document.getElementById('time'), tctx = tl.getContext('2d');
+const prof = document.getElementById('prof'), pctx = prof.getContext('2d');
+const W = disk.width, H = disk.height;
+const RMIN = 0.4, RMAX = 2.5, EXT = 2.62, SCL = W / (2 * EXT), CX = W / 2, CY = H / 2;
+const BASE_MS = 300;
+
+let meta = null, playIdx = null, follow = true, playing = false, dir = 1;
+let cur = null, drawToken = 0, acc = 0, lastTick = performance.now(), lastRange = null;
+
+function cmap(x) {
+  const s = [[0,3,7],[22,11,57],[66,10,104],[106,23,110],[147,38,103],
+             [188,55,84],[221,81,58],[243,120,25],[252,165,10],[252,255,164]];
+  const t = Math.max(0, Math.min(0.9999, x)) * (s.length - 1);
+  const i = Math.floor(t), f = t - i, a = s[i], b = s[i + 1] || s[i];
+  return [a[0] + (b[0]-a[0]) * f, a[1] + (b[1]-a[1]) * f, a[2] + (b[2]-a[2]) * f];
+}
+
+function parse(buf) {
+  const dv = new DataView(buf);
+  const magic = String.fromCharCode(dv.getUint8(0), dv.getUint8(1), dv.getUint8(2), dv.getUint8(3));
+  if (magic !== 'FG3D') throw new Error('bad magic');
+  const flags = dv.getUint16(6, true);
+  const fid = dv.getUint32(8, true), dropped = dv.getUint32(12, true);
+  const nx = dv.getUint32(16, true), ny = dv.getUint32(20, true), nz = dv.getUint32(24, true);
+  const nfields = dv.getUint32(28, true);
+  const t = dv.getFloat64(32, true), theta = dv.getFloat64(40, true);
+  const omega = dv.getFloat64(48, true), dt = dv.getFloat64(56, true);
+  const npl = dv.getUint32(64, true), plen = dv.getUint32(68, true);
+  const planets = [];
+  for (let p = 0; p < npl; p++) {
+    const b = 80 + p * 56;
+    planets.push({ x: dv.getFloat64(b, true), y: dv.getFloat64(b + 8, true),
+                   m: dv.getFloat64(b + 48, true) });
+  }
+  const off = 80 + npl * 56, ncell = nx * ny, fields = [];
+  for (let f = 0; f < nfields; f++) fields.push(new Float32Array(buf, off + f * ncell * 4, ncell));
+  return { flags, fid, dropped, nx, ny, nz, nfields, t, theta, omega, dt,
+           planets, fields, payload: plen };
+}
+
+function drawDisk(f) {
+  const nx = f.nx, ny = f.ny, dens = f.fields[0];
+  const inert = document.getElementById('mode').value === 'inertial';
+  const dth = inert ? f.theta : 0;
+
+  const cmode = document.getElementById('cscale').value;
+  const tf = (v) => (cmode === 'log' ? Math.log10(v) : v);
+  let lo = Infinity, hi = -Infinity;
+  for (let k = 0; k < dens.length; k++) {
+    const v = dens[k]; if (!(v > 0)) continue;
+    const l = tf(v); if (l < lo) lo = l; if (l > hi) hi = l;
+  }
+  if (isFinite(lo) && hi > lo) {
+    const NB = 256, hist = new Uint32Array(NB), sc = (NB - 1) / (hi - lo);
+    let n = 0;
+    for (let k = 0; k < dens.length; k++) {
+      const v = dens[k]; if (!(v > 0)) continue;
+      hist[Math.min(NB - 1, Math.floor((tf(v) - lo) * sc))]++; n++;
+    }
+    const pick = (q) => { let a2 = 0, tgt = q * n;
+      for (let b = 0; b < NB; b++) { a2 += hist[b]; if (a2 >= tgt) return lo + b / sc; }
+      return hi; };
+    lo = pick(0.01); hi = pick(0.995);
+  }
+  const span = Math.max(1e-12, hi - lo);
+  lastRange = { lo: lo, hi: hi, mode: cmode };
+
+  const img = dctx.createImageData(W, H), px = img.data;
+  const dphi = 2 * Math.PI / nx, dr = (RMAX - RMIN) / ny;
+  const shift = ((dth % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+  for (let py = 0; py < H; py++) {
+    const y = (CY - py - 0.5) / SCL;
+    for (let pxi = 0; pxi < W; pxi++) {
+      const x = (pxi - CX + 0.5) / SCL;
+      const r = Math.hypot(x, y);
+      if (r < RMIN || r > RMAX) continue;
+      let phi = Math.atan2(y, x) - shift;
+      phi = ((phi + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+      const fi0 = (phi + Math.PI) / dphi - 0.5, fj0 = (r - RMIN) / dr - 0.5;
+      const i0 = Math.floor(fi0), fx = fi0 - i0;
+      let j0 = Math.floor(fj0); const fy = fj0 - j0;
+      const ia = ((i0 % nx) + nx) % nx, ib = (ia + 1) % nx;
+      j0 = Math.min(ny - 2, Math.max(0, j0)); const jb = j0 + 1;
+      const v00 = dens[j0 * nx + ia], v10 = dens[j0 * nx + ib];
+      const v01 = dens[jb * nx + ia], v11 = dens[jb * nx + ib];
+      const v = (v00 * (1 - fx) + v10 * fx) * (1 - fy) + (v01 * (1 - fx) + v11 * fx) * fy;
+      const u = v > 0 ? Math.min(1, Math.max(0, (tf(v) - lo) / span)) : 0;
+      const c = cmap(u), o = (py * W + pxi) * 4;
+      px[o] = c[0]; px[o + 1] = c[1]; px[o + 2] = c[2]; px[o + 3] = 255;
+    }
+  }
+  dctx.putImageData(img, 0, 0);
+
+  if (document.getElementById('arrows').checked && f.nfields >= 3) {
+    const vx = f.fields[1], vy = f.fields[2], mean = new Float64Array(ny);
+    for (let j = 0; j < ny; j++) {
+      let s = 0; for (let i = 0; i < nx; i++) s += vx[j * nx + i];
+      mean[j] = s / nx;
+    }
+    const mags = new Float32Array(nx * ny);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
+      mags[j * nx + i] = Math.abs(vx[j * nx + i] - mean[j]);
+    const sorted = Array.from(mags).sort((a, b) => a - b);
+    const vmax = Math.max(1e-12, sorted[Math.floor(0.98 * sorted.length)]);
+    dctx.strokeStyle = 'rgba(90,209,200,0.85)'; dctx.lineWidth = 1;
+    for (let j = 6; j < ny; j += 8) {
+      const r = RMIN + (j + 0.5) * dr;
+      for (let i = 0; i < nx; i += 12) {
+        const phi = -Math.PI + (i + 0.5) * dphi + shift;
+        const pr = vx[j * nx + i] - mean[j], pt = vy[j * nx + i];
+        const sc = 34 / vmax;
+        const x0 = CX + Math.cos(phi) * r * SCL, y0 = CY - Math.sin(phi) * r * SCL;
+        const ux = Math.cos(phi) * pr - Math.sin(phi) * pt;
+        const uy = Math.sin(phi) * pr + Math.cos(phi) * pt;
+        let ax = ux * sc, ay = uy * sc;
+        const alen = Math.hypot(ax, ay), cap = 16;
+        if (alen > cap) { ax *= cap / alen; ay *= cap / alen; }
+        const x1 = x0 + ax, y1 = y0 - ay;
+        dctx.beginPath(); dctx.moveTo(x0, y0); dctx.lineTo(x1, y1); dctx.stroke();
+        const nl = Math.hypot(ax, ay);
+        if (nl > 3.5) {
+          const ang = Math.atan2(-ay, ax), hl = Math.min(5, 1.4 + nl * 0.28), sp = 0.45;
+          dctx.beginPath();
+          dctx.moveTo(x1, y1);
+          dctx.lineTo(x1 - hl * Math.cos(ang - sp), y1 - hl * Math.sin(ang - sp));
+          dctx.moveTo(x1, y1);
+          dctx.lineTo(x1 - hl * Math.cos(ang + sp), y1 - hl * Math.sin(ang + sp));
+          dctx.stroke();
+        }
+      }
+    }
+  }
+
+  for (const p of f.planets) {
+    const c = Math.cos(dth), s = Math.sin(dth);
+    const wx = c * p.x - s * p.y, wy = s * p.x + c * p.y;
+    dctx.beginPath(); dctx.arc(CX + wx * SCL, CY - wy * SCL, 5, 0, 2 * Math.PI);
+    dctx.fillStyle = '#ffd166'; dctx.fill();
+    dctx.strokeStyle = '#0b0e13'; dctx.lineWidth = 1.5; dctx.stroke();
+  }
+  dctx.fillStyle = 'rgba(200,211,224,.75)'; dctx.font = '11px monospace';
+  dctx.fillText((inert ? 'inertial frame' : 'rotating frame') + '   r ' + RMIN + '-' + RMAX, 8, H - 10);
+  drawCbar();
+
+  // radial profile with axes
+  pctx.clearRect(0, 0, prof.width, prof.height);
+  const pw = prof.width, ph = prof.height, mL = 54, mR = 10, mT = 18, mB = 26;
+  const iw = pw - mL - mR, ih = ph - mT - mB;
+  const prof2 = new Float64Array(ny);
+  let plo = Infinity, phi2 = -Infinity;
+  for (let j = 0; j < ny; j++) {
+    let s2 = 0; for (let i = 0; i < nx; i++) s2 += dens[j * nx + i];
+    prof2[j] = s2 / nx;
+    if (prof2[j] > 0) { const l = Math.log10(prof2[j]); if (l < plo) plo = l; if (l > phi2) phi2 = l; }
+  }
+  const psp = Math.max(1e-6, phi2 - plo);
+  const xOf = (r) => mL + ((r - RMIN) / (RMAX - RMIN)) * iw;
+  const yOf = (v) => mT + (1 - (Math.log10(Math.max(v, 1e-30)) - plo) / psp) * ih;
+  pctx.strokeStyle = '#1b232e'; pctx.lineWidth = 1;
+  pctx.strokeRect(mL, mT, iw, ih);
+  pctx.strokeStyle = '#5ad1c8'; pctx.lineWidth = 1.5; pctx.beginPath();
+  for (let j = 0; j < ny; j++) {
+    const r = RMIN + (j + 0.5) * (RMAX - RMIN) / ny;
+    const x = xOf(r), y = yOf(prof2[j]);
+    j ? pctx.lineTo(x, y) : pctx.moveTo(x, y);
+  }
+  pctx.stroke();
+  pctx.fillStyle = '#6b7a8f'; pctx.font = '10px monospace'; pctx.strokeStyle = '#6b7a8f';
+  pctx.textAlign = 'center';
+  for (const rr of [0.5, 1.0, 1.5, 2.0, 2.5]) {
+    const x = xOf(rr);
+    pctx.beginPath(); pctx.moveTo(x, mT + ih); pctx.lineTo(x, mT + ih + 3); pctx.stroke();
+    pctx.fillText(rr.toFixed(1), x, mT + ih + 14);
+  }
+  pctx.textAlign = 'right';
+  pctx.fillText(Math.pow(10, phi2).toExponential(1), mL - 6, mT + 8);
+  pctx.fillText(Math.pow(10, plo).toExponential(1), mL - 6, mT + ih);
+  pctx.textAlign = 'center';
+  pctx.fillText('radius  r', mL + iw / 2, ph - 3);
+  pctx.textAlign = 'left';
+  pctx.fillText('Sigma(r), log scale', mL, 11);
+
+  document.getElementById('t').textContent = f.t.toFixed(2);
+  document.getElementById('orbit').textContent = (f.t * f.omega / (2 * Math.PI)).toFixed(2);
+  document.getElementById('fid').textContent = f.fid;
+  document.getElementById('theta').textContent = f.theta.toFixed(3);
+  document.getElementById('nf').textContent = f.nfields + ' fields, f32';
+}
+
+function drawCbar() {
+  const c = document.getElementById('cbar'), ctx = c.getContext('2d');
+  const w = c.width, h = c.height, y0 = 2, bh = 12;
+  ctx.clearRect(0, 0, w, h);
+  if (!lastRange) return;
+  const g = ctx.createLinearGradient(0, 0, w, 0);
+  for (let i = 0; i <= 10; i++) {
+    const k = cmap(i / 10).map((v) => Math.round(v));
+    g.addColorStop(i / 10, 'rgb(' + k.join(',') + ')');
+  }
+  ctx.fillStyle = g; ctx.fillRect(0, y0, w, bh);
+  ctx.strokeStyle = '#1b232e'; ctx.lineWidth = 1; ctx.strokeRect(0, y0, w, bh);
+  ctx.fillStyle = '#6b7a8f'; ctx.font = '10px monospace';
+  ctx.textAlign = 'left';
+  const fmt = (x) => (lastRange.mode === 'log') ? Math.pow(10, x).toExponential(2) : x.toPrecision(3);
+  ctx.fillText('Sigma ' + fmt(lastRange.lo), 2, y0 + bh + 13);
+  ctx.textAlign = 'center';
+  ctx.fillText(lastRange.mode === 'log' ? 'log scale' : 'linear scale', w / 2, y0 + bh + 13);
+  ctx.textAlign = 'right';
+  ctx.fillText(fmt(lastRange.hi), w - 2, y0 + bh + 13);
+  ctx.textAlign = 'left';
+}
+
+function drawTimeline() {
+  tctx.clearRect(0, 0, tl.width, tl.height);
+  if (!meta || meta.max_orbits === null) return;
+  const pad = 10, y0 = 26, hgt = 16;
+  const xOf = (o) => pad + (Math.max(0, Math.min(meta.max_orbits, o)) / meta.max_orbits) * (tl.width - 2 * pad);
+  tctx.strokeStyle = '#1b232e'; tctx.lineWidth = 1;
+  tctx.strokeRect(pad, y0, tl.width - 2 * pad, hgt);
+  if (meta.orbit_first !== null && meta.orbit_last !== null) {
+    const a = xOf(meta.orbit_first), b = xOf(meta.orbit_last);
+    tctx.fillStyle = 'rgba(61,220,132,0.30)';
+    tctx.fillRect(a, y0, Math.max(1, b - a), hgt);
+    tctx.strokeStyle = '#3ddc84'; tctx.strokeRect(a, y0, Math.max(1, b - a), hgt);
+    const co = cur ? cur.t * cur.omega / (2 * Math.PI) : meta.orbit_last;
+    const px = xOf(co);
+    tctx.strokeStyle = '#ffd166'; tctx.lineWidth = 2;
+    tctx.beginPath(); tctx.moveTo(px, y0 - 6); tctx.lineTo(px, y0 + hgt + 6); tctx.stroke();
+    tctx.fillStyle = '#c8d3e0'; tctx.font = '10px monospace';
+    tctx.fillText('orbit ' + co.toFixed(2) + ' / ' + meta.max_orbits.toFixed(0), pad, 16);
+    tctx.fillStyle = '#6b7a8f';
+    tctx.fillText('0', pad, y0 + hgt + 16);
+    const lbl = 'buffered ' + meta.orbit_first.toFixed(1) + ' - ' + meta.orbit_last.toFixed(1) + ' orbits';
+    tctx.fillText(lbl, pad + 18, y0 + hgt + 16);
+  }
+}
+
+function updateSimState() {
+  const s = document.getElementById('simstate');
+  if (!meta) return;
+  if (meta.buffer_full) s.textContent = 'STOPPED - buffer full';
+  else if (meta.sim_stopped) s.textContent = 'stopped';
+  else if (meta.sim_alive) s.textContent = 'computing';
+  else s.textContent = 'finished';
+  document.getElementById('buf').textContent =
+    meta.count ? (meta.count + ' frames, ' + meta.orbit_first.toFixed(1) + '-' + meta.orbit_last.toFixed(1) + ' orbits') : 'empty';
+  document.getElementById('count').textContent = meta.count;
+  document.getElementById('win').textContent = meta.count ? (meta.orbit_first.toFixed(2) + ' - ' + meta.orbit_last.toFixed(2) + ' orbits') : '—';
+  document.getElementById('bmax').textContent = meta.max_orbits.toFixed(0) + ' orbits';
+  document.getElementById('prod').textContent = meta.producer;
+  document.getElementById('grid').textContent = '384 x 128 x 1';
+  document.getElementById('bSim').textContent = meta.sim_stopped ? 'sim run' : 'sim stop';
+}
+
+async function pullMeta() {
+  try {
+    meta = await (await fetch('/meta', { cache: 'no-store' })).json();
+    updateSimState(); drawTimeline();
+    const first = (playIdx === null) && meta.index_last !== null;
+    if (first) playIdx = meta.index_last;
+    if (playIdx !== null && (first || (follow && meta.index_last !== null && playIdx !== meta.index_last))) {
+      if (follow && meta.index_last !== null) playIdx = meta.index_last;
+      await drawAt(playIdx);
+    }
+  } catch (e) { document.getElementById('simstate').textContent = 'meta error'; }
+  setTimeout(pullMeta, 400);
+}
+
+async function drawAt(idx) {
+  const my = ++drawToken;
+  try {
+    const r = await fetch('/frame?at=' + idx, { cache: 'no-store' });
+    if (r.status !== 200) return;
+    const f = parse(await r.arrayBuffer());
+    if (my !== drawToken) return;          // superseded by a newer request
+    cur = f; drawDisk(f); drawTimeline();
+  } catch (e) { /* keep the previous image */ }
+}
+
+function loop(now) {
+  const dt = now - lastTick; lastTick = now;
+  if (playing && meta && meta.index_first !== null) {
+    acc += dt;
+    const step = 1000 / parseFloat(document.getElementById('speed').value);
+    let moved = false;
+    while (acc >= step) {
+      acc -= step;
+      let next = playIdx + dir;
+      if (next < meta.index_first) { next = meta.index_first; playing = false; }
+      if (next > meta.index_last) { next = meta.index_last; playing = false; follow = true; }
+      if (next !== playIdx) { playIdx = next; moved = true; }
+    }
+    if (moved) { follow = false; drawAt(playIdx); setPlayLabel(); }
+  }
+  requestAnimationFrame(loop);
+}
+
+function setPlayLabel() {
+  document.getElementById('bPlay').textContent = playing ? 'pause' : 'play';
+}
+
+document.getElementById('bLive').onclick = () => {
+  playing = false; dir = 1; follow = true; setPlayLabel();
+  if (meta && meta.index_last !== null) { playIdx = meta.index_last; drawAt(playIdx); }
+};
+document.getElementById('bRev').onclick = () => { dir = -1; playing = true; follow = false; acc = 0; setPlayLabel(); };
+document.getElementById('bFwd').onclick = () => { dir = 1; playing = true; follow = false; acc = 0; setPlayLabel(); };
+document.getElementById('bPlay').onclick = () => {
+  playing = !playing;
+  if (playing && playIdx >= (meta ? meta.index_last : 0)) follow = true;
+  acc = 0; setPlayLabel();
+};
+document.getElementById('bSim').onclick = async () => {
+  const action = (meta && meta.sim_stopped) ? 'sim_run' : 'sim_stop';
+  await fetch('/control', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action }) });
+  pullMeta();
+};
+document.getElementById('mode').onchange = () => cur && drawDisk(cur);
+document.getElementById('cscale').onchange = () => cur && drawDisk(cur);
+document.getElementById('arrows').onchange = () => cur && drawDisk(cur);
+
+document.getElementById('time').addEventListener('click', (ev) => {
+  if (!meta || meta.orbit_first === null) return;
+  const rect = tl.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const pad = 10;
+  const frac = (x - pad) / (tl.width - 2 * pad);
+  const orbit = Math.max(0, Math.min(meta.max_orbits, frac * meta.max_orbits));
+  if (orbit < meta.orbit_first || orbit > meta.orbit_last) return;   // outside the recording
+  const oFirst = meta.orbit_first, oLast = meta.orbit_last;
+  const frac2 = (orbit - oFirst) / Math.max(1e-9, oLast - oFirst);
+  playIdx = Math.round(meta.index_first + frac2 * (meta.index_last - meta.index_first));
+  playing = false; follow = false; setPlayLabel();
+  drawAt(playIdx);
+});
+
+requestAnimationFrame(loop);
+pullMeta();
+</script>
+</body>
+</html>
